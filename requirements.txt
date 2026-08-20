@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy<2.0
+matplotlib
+fastf1>=3.8.3
+scipy
+plotly
