@@ -2,10 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import matplotlib.pyplot as plt
 import fastf1
 from fastf1.core import Session
 from Leonardo_V2_2 import donnees   
+
+@st.cache_data(show_spinner=False)
+def load_telemetry(annee, circuit, session, pilote):
+    return donnees(annee, circuit, session, pilote)
 
 # Get language from session state (set in main app)
 lang = st.session_state.lang
@@ -95,11 +98,7 @@ T = {
     "data_loaded_success": {
         "Français": "✅ Données chargées avec succès", 
         "English": "✅ Data loaded successfully"
-    },
-    "tab_traj_alt": {"Français": "Trajectoire & Altitude", "English": "Trajectory & Altitude"},
-    "tab_vit_acc": {"Français": "Vitesses & Accélérations", "English": "Speed & Accelerations"},
-    "tab_aero": {"Français": "Aérodynamique", "English": "Aerodynamics"},
-    "tab_forces": {"Français": "Forces", "English": "Forces"},
+    }
 
 }
 st.session_state.T = T
@@ -190,6 +189,7 @@ def get_gp_list(year):
     except:
         return []
 
+@st.cache_data
 def get_session_list(year, gp_name):
     """Extract session names cleanly from fastf1 event schedule."""
     try:
@@ -241,19 +241,11 @@ def get_session_list(year, gp_name):
         st.error(f"Erreur dans get_session_list: {e}")
         return []
 
-def get_driver_list(year, gp_name, session_name):
-    session_fastf1 = session_to_fastf1(session_name)
-    ses = fastf1.get_session(year, gp_name, session_fastf1)
+@st.cache_data
+def get_driver_map(year, gp_name, session_name):
+    ses = fastf1.get_session(year, gp_name, session_name)
     ses.load(laps=False, telemetry=False, weather=False, messages=False)
-
-    codes = []
-    for num in ses.drivers:
-        info = ses.get_driver(num)
-        code = info.get("Abbreviation", None)
-        if code:
-            codes.append(code)
-
-    return sorted(list(set(codes)))
+    return {ses.get_driver(n)["Abbreviation"]: ses.get_driver(n)["DriverNumber"] for n in ses.drivers}
 
 # -------------------------------------------------------------------------
 #  NEW TOP CONTAINER WITH ALL CONTROLS
@@ -302,8 +294,11 @@ with st.container():
         st.info(T["select_confirm_session"][lang])
         st.stop()
 
+    session_fastf1 = session_to_fastf1(session_name)   # <-- add this line here
+
     # --- DRIVER ---
-    drivers = get_driver_list(year, gp_name, session_name)
+    driver_map = get_driver_map(year, gp_name, session_fastf1)
+    drivers = sorted(driver_map.keys())
 
     pilote_code = st.selectbox(
         T["driver"][lang],
@@ -325,608 +320,612 @@ with st.container():
 #  DATA LOADING + MAIN DISPLAY
 # -------------------------------------------------------------------------
 if load_btn:
-    pilote = st.session_state["pilote_code"]
-
-    # Convert French → English for FastF1
-    session_fastf1 = session_to_fastf1(session_name)
-
-    ses = fastf1.get_session(year, gp_name, session_fastf1)
-
-    ses.load(laps=False, telemetry=False)
-
-    driver_number = None
-    for num in ses.drivers:
-        info = ses.get_driver(num)
-        if info["Abbreviation"] == pilote_code:
-            driver_number = info["DriverNumber"]
-            break
+    driver_number = driver_map.get(pilote_code)
 
     if driver_number is None:
         st.error(f"Impossible de trouver le pilote '{pilote_code}'")
         st.stop()
 
-    pilote = driver_number
-
-    st.write(f"### {year} ▸ {gp_name} ▸ {session_name} ▸ {pilote_code}")
-
     with st.spinner(T["loading_data"][lang]):
         try:
-            data, track, circuit_info, df_corners = donnees(
-                year, gp_name, session_fastf1, pilote
+            data, track, circuit_info, df_corners = load_telemetry(
+                year, gp_name, session_fastf1, driver_number
+            )
+            # save everything needed to redraw, so a rerun (e.g. language switch)
+            # doesn't lose it
+            st.session_state.telemetry_data = data
+            st.session_state.telemetry_track = track
+            st.session_state.telemetry_circuit_info = circuit_info
+            st.session_state.telemetry_df_corners = df_corners
+            st.session_state.telemetry_label = (year, gp_name, session_name, pilote_code)
+        except Exception as e:
+            st.error(f"❌ Erreur lors du chargement des données : {e}")
+            st.session_state.pop("telemetry_data", None)
+
+# --- RENDER: runs on every rerun as long as we have data, button or not ---
+if "telemetry_data" in st.session_state:
+    data = st.session_state.telemetry_data
+    track = st.session_state.telemetry_track
+    circuit_info = st.session_state.telemetry_circuit_info
+    df_corners = st.session_state.telemetry_df_corners
+    yr, gp, sess, drv = st.session_state.telemetry_label
+
+    st.success(T["data_loaded_success"][lang])
+    st.write(f"### {yr} ▸ {gp} ▸ {sess} ▸ {drv}")
+
+    try:
+            # -----------------------------------------------------------------
+            #  TRAJECTOIRE (track map)
+            # -----------------------------------------------------------------
+            X = track[:, 0]
+            Y = track[:, 1]
+
+            st.subheader(T["traj_title"][lang])
+            fig_traj = go.Figure()
+
+            fig_traj.add_trace(go.Scatter(
+                x=X,
+                y=Y,
+                mode='lines',
+                line=dict(color='blue', width=2),
+                showlegend=False,
+            ))
+
+            show_corners = True
+            if show_corners and hasattr(circuit_info, "corners"):
+                offset_vector = np.array([500, 0])  
+
+                def rotate(xy, *, angle):
+                    rot_mat = np.array([
+                        [np.cos(angle), np.sin(angle)],
+                        [-np.sin(angle), np.cos(angle)]
+                    ])
+                    return np.matmul(xy, rot_mat)
+
+                track_angle = circuit_info.rotation / 180 * np.pi
+
+                for _, corner in circuit_info.corners.iterrows():
+                    txt = f"{corner['Number']}{corner['Letter']}"
+                    offset_angle = corner['Angle'] / 180 * np.pi
+
+                    offset_x, offset_y = rotate(offset_vector, angle=offset_angle)
+                    text_x = corner['X'] + offset_x
+                    text_y = corner['Y'] + offset_y
+
+                    text_x, text_y = rotate(np.array([text_x, text_y]), angle=track_angle)
+                    track_x, track_y = rotate(np.array([corner['X'], corner['Y']]), angle=track_angle)
+
+                    fig_traj.add_trace(go.Scatter(
+                        x=[track_x, text_x],
+                        y=[track_y, text_y],
+                        mode="lines",
+                        line=dict(color="gray", width=1),
+                        showlegend=False
+                    ))
+
+                    fig_traj.add_trace(go.Scatter(
+                        x=[text_x],
+                        y=[text_y],
+                        mode="markers+text",
+                        marker=dict(size=14, color="gray"),
+                        text=[txt],
+                        textposition="middle center",
+                        textfont=dict(color="white", size=10),
+                        showlegend=False
+                    ))
+
+            fig_traj.update_layout(
+                xaxis_title=T["traj_x"][lang],
+                yaxis_title=T["traj_y"][lang],
+                width=800,
+                height=600
             )
 
+            fig_traj.update_yaxes(scaleanchor="x", scaleratio=1)
 
-            st.success(T["data_loaded_success"][lang])
-
-            # Create tabs to distribute the rendering load
-            tab1, tab2, tab3, tab4 = st.tabs([
-                T["tab_traj_alt"][lang], 
-                T["tab_vit_acc"][lang], 
-                T["tab_aero"][lang], 
-                T["tab_forces"][lang]
-            ])
+            st.plotly_chart(fig_traj, use_container_width=True)
 
             # -----------------------------------------------------------------
-            # TAB 1: TRAJECTOIRE ET ALTITUDE
+            #  ALTITUDE
             # -----------------------------------------------------------------
-            with tab1:
-                X = track[:, 0]
-                Y = track[:, 1]
+            st.subheader(T["alt_title"][lang])
 
-                st.subheader(T["traj_title"][lang])
-                fig_traj = go.Figure()
+            fig_alt = go.Figure()
+            fig_alt.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Altitude"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name='Altitude'
+            ))
 
-                fig_traj.add_trace(go.Scatter(
-                                x=X,
-                                y=Y,
-                                mode='lines',
-                                line=dict(color='blue', width=2),
-                                showlegend=False,))
-                
-                show_corners = True
-                if show_corners and hasattr(circuit_info, "corners"):
-                    offset_vector = np.array([500, 0])  
-
-                    def rotate(xy, *, angle):
-                        rot_mat = np.array([
-                            [np.cos(angle), np.sin(angle)],
-                            [-np.sin(angle), np.cos(angle)]
-                        ])
-                        return np.matmul(xy, rot_mat)
-
-                    track_angle = circuit_info.rotation / 180 * np.pi
-
-                    for _, corner in circuit_info.corners.iterrows():
-                        txt = f"{corner['Number']}{corner['Letter']}"
-                        offset_angle = corner['Angle'] / 180 * np.pi
-
-                        offset_x, offset_y = rotate(offset_vector, angle=offset_angle)
-                        text_x = corner['X'] + offset_x
-                        text_y = corner['Y'] + offset_y
-
-                        text_x, text_y = rotate(np.array([text_x, text_y]), angle=track_angle)
-                        track_x, track_y = rotate(np.array([corner['X'], corner['Y']]), angle=track_angle)
-
-                        fig_traj.add_trace(go.Scatter(
-                            x=[track_x, text_x],
-                            y=[track_y, text_y],
-                            mode="lines",
-                            line=dict(color="gray", width=1),
-                            showlegend=False
-                        ))
-
-                        fig_traj.add_trace(go.Scatter(
-                            x=[text_x],
-                            y=[text_y],
-                            mode="markers+text",
-                            marker=dict(size=14, color="gray"),
-                            text=[txt],
-                            textposition="middle center",
-                            textfont=dict(color="white", size=10),
-                            showlegend=False
-                        ))
-
-                fig_traj.update_layout(
-                    xaxis_title=T["traj_x"][lang],
-                    yaxis_title=T["traj_y"][lang],
-                    width=800,
-                    height=600
+            for _, row in df_corners.iterrows():
+                fig_alt.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
                 )
-                fig_traj.update_yaxes(scaleanchor="x", scaleratio=1)
-                st.plotly_chart(fig_traj, use_container_width=True)
-
-# -----------------------------------------------------------------# -----------------------------------------------------------------
-
-                st.subheader(T["alt_title"][lang])
-                fig_alt = go.Figure()
-
-                fig_alt.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Altitude"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name='Altitude'
-                ))
-
-                for _, row in df_corners.iterrows():
-                    fig_alt.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_alt.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Altitude"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white"),
-                    )
-
-                fig_alt.update_layout(
-                    xaxis_title=T["dist"][lang],
-                    yaxis_title=T["alt_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)'
+                fig_alt.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Altitude"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white"),
                 )
 
-                fig_alt.update_traces(
-                    hovertemplate=T["alt_hover"][lang]
-                )
+            fig_alt.update_layout(
+                xaxis_title=T["dist"][lang],
+                yaxis_title=T["alt_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
 
-                
-                st.plotly_chart(fig_alt, use_container_width=True)
+            fig_alt.update_traces(
+                hovertemplate=T["alt_hover"][lang]
+            )
+
+            st.plotly_chart(fig_alt, use_container_width=True)
 
             # -----------------------------------------------------------------
-            # TAB 2: VITESSE ET ACCELERATIONS
+            #  VITESSE
             # -----------------------------------------------------------------
-            with tab2:
-                st.subheader(T["vit_title"][lang])
-                fig_vit = go.Figure()
+            st.subheader(T["vit_title"][lang])
 
-                vx_ms = data["vx"]
+            fig_vit = go.Figure()
+            vx_ms = data["vx"]
 
-                fig_vit.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=vx_ms,
-                    mode="lines",
-                    line=dict(color="blue", width=2),
-                    yaxis="y1"
-                ))
+            fig_vit.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=vx_ms,
+                mode="lines",
+                line=dict(color="blue", width=2),
+                yaxis="y1"
+            ))
 
-                for _, row in df_corners.iterrows():
-                    fig_vit.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_vit.add_annotation(
-                        x=row["Distance"],
-                        y=min(vx_ms) - 10,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=14, color="white")
-                    )
-
-                fig_vit.update_layout(
-                    xaxis_title=T["dist"][lang],
-                    yaxis_title=T["vit_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor="rgba(0,0,0,0)"
+            for _, row in df_corners.iterrows():
+                fig_vit.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_vit.add_annotation(
+                    x=row["Distance"],
+                    y=min(vx_ms) - 10,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=14, color="white")
                 )
 
-                fig_vit.update_traces(hovertemplate=T["vit_hover"][lang])
-                
-                st.plotly_chart(fig_vit, use_container_width=True)
+            fig_vit.update_layout(
+                xaxis_title=T["dist"][lang],
+                yaxis_title=T["vit_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
 
-# -----------------------------------------------------------------# -----------------------------------------------------------------
+            fig_vit.update_traces(hovertemplate=T["vit_hover"][lang])
 
-
-                st.subheader(T["at_title"][lang])
-                fig_a_t = go.Figure()
-
-                fig_a_t.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Accélération tangentielle"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name='A_t'
-                ))
-
-                for _, row in df_corners.iterrows():
-                    fig_a_t.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_a_t.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Accélération tangentielle"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
-
-                fig_a_t.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["at_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)'
-                )
-
-                fig_a_t.update_traces(hovertemplate=T["at_hover"][lang])
-                st.plotly_chart(fig_a_t, use_container_width=True)
-
-
-# -----------------------------------------------------------------# -----------------------------------------------------------------
-
-                st.subheader(T["an_title"][lang])
-                fig_a_n = go.Figure()
-
-                fig_a_n.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Accélération normale"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name='A_n'
-                ))
-
-                for _, row in df_corners.iterrows():
-                    fig_a_n.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_a_n.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Accélération normale"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
-
-                fig_a_n.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["an_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)'
-                )
-
-                fig_a_n.update_traces(hovertemplate=T["an_hover"][lang])
-
-                st.plotly_chart(fig_a_n, use_container_width=True)
-
-# -----------------------------------------------------------------# -----------------------------------------------------------------
-
-
-                st.subheader(T["av_title"][lang])
-                fig_a_v = go.Figure()
-
-                fig_a_v.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Accélération verticale"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name='A_v'
-                ))
-
-                for _, row in df_corners.iterrows():
-                    fig_a_v.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_a_v.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Accélération verticale"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
-
-                fig_a_v.update_layout(
-                    xaxis_title=T["dist"][lang],
-                    yaxis_title=T["av_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)'
-                )
-
-                fig_a_v.update_traces(hovertemplate=T["av_hover"][lang])
-
-                st.plotly_chart(fig_a_v, use_container_width=True)
+            st.plotly_chart(fig_vit, use_container_width=True)
 
             # -----------------------------------------------------------------
-            # TAB 3: AERODYNAMIQUE
+            #  ACCÉLÉRATION TANGENTIELLE
             # -----------------------------------------------------------------
-            with tab3:
-                st.subheader(T["port_title"][lang])
-                fig_portance = go.Figure()
+            st.subheader(T["at_title"][lang])
 
-                # Courbe moyenne
-                fig_portance.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Portance_moy"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name=T["port_name"][lang]
-                ))
+            fig_a_t = go.Figure()
 
-                # Zone min-max
-                fig_portance.add_trace(go.Scatter(
-                    x=pd.concat([data["Distance"], data["Distance"][::-1]]),
-                    y=pd.concat([data["Portance_max"], data["Portance_min"][::-1]]),
-                    fill='toself',
-                    fillcolor='rgba(0, 0, 255, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    name='min–max',
-                    showlegend=False
-                ))
+            fig_a_t.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Accélération tangentielle"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name='A_t'
+            ))
 
-                for _, row in df_corners.iterrows():
-                    fig_portance.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_portance.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Portance_min"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
-
-                fig_portance.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["port_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    showlegend=False
+            for _, row in df_corners.iterrows():
+                fig_a_t.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_a_t.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Accélération tangentielle"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
                 )
 
-                fig_portance.update_traces(hovertemplate=T["port_hover"][lang])
-                st.plotly_chart(fig_portance, use_container_width=True)
+            fig_a_t.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["at_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
 
-# -----------------------------------------------------------------# -----------------------------------------------------------------
+            fig_a_t.update_traces(hovertemplate=T["at_hover"][lang])
 
-                st.subheader(T["train_title"][lang])
-                fig_trainee = go.Figure()
-
-                fig_trainee.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Trainée_moy"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name=T["train_name"][lang]
-                ))
-
-                fig_trainee.add_trace(go.Scatter(
-                    x=pd.concat([data["Distance"], data["Distance"][::-1]]),
-                    y=pd.concat([data["Trainée_max"], data["Trainée_min"][::-1]]),
-                    fill='toself',
-                    fillcolor='rgba(0, 0, 255, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    name='min–max',
-                    showlegend=False
-                ))
-
-                for _, row in df_corners.iterrows():
-                    fig_trainee.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_trainee.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Trainée_min"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
-
-                fig_trainee.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["train_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    showlegend=False
-                )
-
-                fig_trainee.update_traces(hovertemplate=T["train_hover"][lang])
-
-                st.plotly_chart(fig_trainee, use_container_width=True)
+            st.plotly_chart(fig_a_t, use_container_width=True)
 
             # -----------------------------------------------------------------
-            # TAB 4: FORCES
+            #  ACCÉLÉRATION NORMALE
             # -----------------------------------------------------------------
-            with tab4:
-                st.subheader(T["frot_title"][lang])
-                fig_fr = go.Figure()
+            st.subheader(T["an_title"][lang])
 
-                fig_fr.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Force de frottement de roulement moy"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name=T["frot_name"][lang]
-                ))
+            fig_a_n = go.Figure()
 
-                fig_fr.add_trace(go.Scatter(
-                    x=pd.concat([data["Distance"], data["Distance"][::-1]]),
-                    y=pd.concat([data["Force de frottement de roulement max"],
-                                data["Force de frottement de roulement min"][::-1]]),
-                    fill='toself',
-                    fillcolor='rgba(0, 0, 255, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    showlegend=False
-                ))
+            fig_a_n.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Accélération normale"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name='A_n'
+            ))
 
-                for _, row in df_corners.iterrows():
-                    fig_fr.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_fr.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Force de frottement de roulement min"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
-
-                fig_fr.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["frot_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    showlegend=False
+            for _, row in df_corners.iterrows():
+                fig_a_n.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_a_n.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Accélération normale"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
                 )
 
-                fig_fr.update_traces(hovertemplate=T["frot_hover"][lang])
-                st.plotly_chart(fig_fr, use_container_width=True)
+            fig_a_n.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["an_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
 
-# -----------------------------------------------------------------# -----------------------------------------------------------------
+            fig_a_n.update_traces(hovertemplate=T["an_hover"][lang])
 
-                st.subheader(T["mot_title"][lang])
-                fig_m = go.Figure()
+            st.plotly_chart(fig_a_n, use_container_width=True)
 
-                fig_m.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Force motrice moy"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name=T["mot_name"][lang]
-                ))
+            # -----------------------------------------------------------------
+            #  ACCÉLÉRATION VERTICALE
+            # -----------------------------------------------------------------
+            st.subheader(T["av_title"][lang])
 
-                fig_m.add_trace(go.Scatter(
-                    x=pd.concat([data["Distance"], data["Distance"][::-1]]),
-                    y=pd.concat([data["Force motrice max"],
-                                data["Force motrice min"][::-1]]),
-                    fill='toself',
-                    fillcolor='rgba(0, 0, 255, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    showlegend=False
-                ))
+            fig_a_v = go.Figure()
 
-                for _, row in df_corners.iterrows():
-                    fig_m.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_m.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Force motrice min"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
+            fig_a_v.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Accélération verticale"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name='A_v'
+            ))
 
-                fig_m.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["mot_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    showlegend=False
+            for _, row in df_corners.iterrows():
+                fig_a_v.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_a_v.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Accélération verticale"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
                 )
 
-                fig_m.update_traces(hovertemplate=T["mot_hover"][lang])
+            fig_a_v.update_layout(
+                xaxis_title=T["dist"][lang],
+                yaxis_title=T["av_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)'
+            )
 
-                st.plotly_chart(fig_m, use_container_width=True)
+            fig_a_v.update_traces(hovertemplate=T["av_hover"][lang])
 
-# -----------------------------------------------------------------# -----------------------------------------------------------------
+            st.plotly_chart(fig_a_v, use_container_width=True)
 
-                st.subheader(T["frein_title"][lang])
-                fig_f = go.Figure()
+            # -----------------------------------------------------------------
+            #  PORTANCE
+            # -----------------------------------------------------------------
+            st.subheader(T["port_title"][lang])
 
-                fig_f.add_trace(go.Scatter(
-                    x=data["Distance"],
-                    y=data["Force de freinage moy"],
-                    mode='lines',
-                    line=dict(color='blue', width=2),
-                    name=T["frein_name"][lang]
-                ))
+            fig_portance = go.Figure()
 
-                fig_f.add_trace(go.Scatter(
-                    x=pd.concat([data["Distance"], data["Distance"][::-1]]),
-                    y=pd.concat([data["Force de freinage max"],
-                                data["Force de freinage min"][::-1]]),
-                    fill='toself',
-                    fillcolor='rgba(0, 0, 255, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    showlegend=False
-                ))
+            # Courbe moyenne
+            fig_portance.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Portance_moy"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name=T["port_name"][lang]
+            ))
 
-                for _, row in df_corners.iterrows():
-                    fig_f.add_vline(
-                        x=row["Distance"],
-                        line=dict(color="gray", dash="dash", width=1),
-                        opacity=1
-                    )
-                    fig_f.add_annotation(
-                        x=row["Distance"],
-                        y=min(data["Force de freinage min"]) - 20,
-                        text=str(int(row["Number"])),
-                        showarrow=False,
-                        xanchor="center",
-                        yanchor="top",
-                        font=dict(size=16, color="white")
-                    )
+            # Zone min-max
+            fig_portance.add_trace(go.Scatter(
+                x=pd.concat([data["Distance"], data["Distance"][::-1]]),
+                y=pd.concat([data["Portance_max"], data["Portance_min"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(0, 0, 255, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='min–max',
+                showlegend=False
+            ))
 
-                fig_f.update_layout(
-                    xaxis_title=T["dist"][lang], 
-                    yaxis_title=T["frein_y"][lang],
-                    width=800,
-                    height=600,
-                    hovermode='x unified',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    showlegend=False
+            for _, row in df_corners.iterrows():
+                fig_portance.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_portance.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Portance_min"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
                 )
 
-                fig_f.update_traces(hovertemplate=T["frein_hover"][lang])
-                st.plotly_chart(fig_f, use_container_width=True)
+            fig_portance.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["port_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)',
+                showlegend=False
+            )
 
+            fig_portance.update_traces(hovertemplate=T["port_hover"][lang])
 
-            
+            st.plotly_chart(fig_portance, use_container_width=True)
 
-        except Exception as e:
-            st.error(f"❌ Erreur lors du chargement ou de l'affichage des données : {e}")
+            # -----------------------------------------------------------------
+            #  TRAÎNÉE
+            # -----------------------------------------------------------------
+            st.subheader(T["train_title"][lang])
+
+            fig_trainee = go.Figure()
+
+            fig_trainee.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Trainée_moy"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name=T["train_name"][lang]
+            ))
+
+            fig_trainee.add_trace(go.Scatter(
+                x=pd.concat([data["Distance"], data["Distance"][::-1]]),
+                y=pd.concat([data["Trainée_max"], data["Trainée_min"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(0, 0, 255, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name='min–max',
+                showlegend=False
+            ))
+
+            for _, row in df_corners.iterrows():
+                fig_trainee.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_trainee.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Trainée_min"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
+                )
+
+            fig_trainee.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["train_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)',
+                showlegend=False
+            )
+
+            fig_trainee.update_traces(hovertemplate=T["train_hover"][lang])
+
+            st.plotly_chart(fig_trainee, use_container_width=True)
+
+            # -----------------------------------------------------------------
+            #  FORCE DE FROTTEMENT DE ROULEMENT
+            # -----------------------------------------------------------------
+            st.subheader(T["frot_title"][lang])
+
+            fig_fr = go.Figure()
+
+            fig_fr.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Force de frottement de roulement moy"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name=T["frot_name"][lang]
+            ))
+
+            fig_fr.add_trace(go.Scatter(
+                x=pd.concat([data["Distance"], data["Distance"][::-1]]),
+                y=pd.concat([data["Force de frottement de roulement max"],
+                            data["Force de frottement de roulement min"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(0, 0, 255, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                showlegend=False
+            ))
+
+            for _, row in df_corners.iterrows():
+                fig_fr.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_fr.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Force de frottement de roulement min"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
+                )
+
+            fig_fr.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["frot_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)',
+                showlegend=False
+            )
+
+            fig_fr.update_traces(hovertemplate=T["frot_hover"][lang])
+
+            st.plotly_chart(fig_fr, use_container_width=True)
+
+            # -----------------------------------------------------------------
+            #  FORCE MOTRICE
+            # -----------------------------------------------------------------
+            st.subheader(T["mot_title"][lang])
+
+            fig_m = go.Figure()
+
+            fig_m.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Force motrice moy"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name=T["mot_name"][lang]
+            ))
+
+            fig_m.add_trace(go.Scatter(
+                x=pd.concat([data["Distance"], data["Distance"][::-1]]),
+                y=pd.concat([data["Force motrice max"],
+                            data["Force motrice min"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(0, 0, 255, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                showlegend=False
+            ))
+
+            for _, row in df_corners.iterrows():
+                fig_m.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_m.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Force motrice min"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
+                )
+
+            fig_m.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["mot_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)',
+                showlegend=False
+            )
+
+            fig_m.update_traces(hovertemplate=T["mot_hover"][lang])
+
+            st.plotly_chart(fig_m, use_container_width=True)
+
+            # -----------------------------------------------------------------
+            #  FORCE DE FREINAGE
+            # -----------------------------------------------------------------
+            st.subheader(T["frein_title"][lang])
+
+            fig_f = go.Figure()
+
+            fig_f.add_trace(go.Scatter(
+                x=data["Distance"],
+                y=data["Force de freinage moy"],
+                mode='lines',
+                line=dict(color='blue', width=2),
+                name=T["frein_name"][lang]
+            ))
+
+            fig_f.add_trace(go.Scatter(
+                x=pd.concat([data["Distance"], data["Distance"][::-1]]),
+                y=pd.concat([data["Force de freinage max"],
+                            data["Force de freinage min"][::-1]]),
+                fill='toself',
+                fillcolor='rgba(0, 0, 255, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                showlegend=False
+            ))
+
+            for _, row in df_corners.iterrows():
+                fig_f.add_vline(
+                    x=row["Distance"],
+                    line=dict(color="gray", dash="dash", width=1),
+                    opacity=1
+                )
+                fig_f.add_annotation(
+                    x=row["Distance"],
+                    y=min(data["Force de freinage min"]) - 20,
+                    text=str(int(row["Number"])),
+                    showarrow=False,
+                    xanchor="center",
+                    yanchor="top",
+                    font=dict(size=16, color="white")
+                )
+
+            fig_f.update_layout(
+                xaxis_title=T["dist"][lang], 
+                yaxis_title=T["frein_y"][lang],
+                width=800,
+                height=600,
+                hovermode='x unified',
+                plot_bgcolor='rgba(0,0,0,0)',
+                showlegend=False
+            )
+
+            fig_f.update_traces(hovertemplate=T["frein_hover"][lang])
+
+            st.plotly_chart(fig_f, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"❌ Erreur lors du chargement ou de l'affichage des données : {e}")
 
 
 
